@@ -13,10 +13,9 @@
 
 import { useNostr } from '@nostrify/react';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { useCallback, useRef } from 'react';
+import { useRef } from 'react';
 
 import { useCurrentUser } from './useCurrentUser';
-import { useDmRelays } from './useDmRelays';
 
 import {
   createRumor,
@@ -29,7 +28,7 @@ import {
   KIND_GIFT_WRAP,
   KIND_EPHEMERAL_GIFT_WRAP,
   KIND_READ_RECEIPT,
-  KIND_DELIVERY_RECEIPT,
+  KIND_DELIVERED_RECEIPT,
   TAG_TYPING,
   TAG_READ_AT,
   TAG_DELIVERED_AT,
@@ -44,8 +43,72 @@ import {
   type NostrEvent,
 } from '@/lib/whisper/constants';
 
-/** A callback for handling incoming unwrapped rumors. */
-type RumorHandler = (rumor: NostrEvent, wrap: NostrEvent) => void;
+/**
+ * Fetch a user's NIP-17 DM relay list (kind 10050).
+ * Returns the relay URLs the user wants gift-wrapped messages published to.
+ */
+async function fetchDmRelays(
+  nostr: ReturnType<typeof useNostr>['nostr'],
+  pubkey: string,
+): Promise<string[]> {
+  try {
+    const [event] = await nostr.query(
+      [{ kinds: [10050], authors: [pubkey], limit: 1 }],
+      { signal: AbortSignal.timeout(3000) },
+    );
+    if (!event) return [];
+    return event.tags
+      .filter(([n]) => n === 'relay')
+      .map(([, url]) => url)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Publish gift-wrapped events to the recipient's DM relays.
+ * Falls back to the app's default write relays (via the pool's event router)
+ * if no DM relays are found.
+ */
+export async function publishGiftWraps(
+  nostr: ReturnType<typeof useNostr>['nostr'],
+  wraps: NostrEvent[],
+  recipientPubkeys: string[],
+): Promise<void> {
+  // Collect target relays from all recipients' DM relay lists
+  const targetRelays = new Set<string>();
+
+  for (const pubkey of recipientPubkeys) {
+    const relays = await fetchDmRelays(nostr, pubkey);
+    relays.forEach((r) => targetRelays.add(r));
+  }
+
+  if (targetRelays.size === 0) {
+    // No DM relays found — fall back to the pool's event router
+    // which publishes to all configured write relays
+    for (const wrap of wraps) {
+      try {
+        await nostr.event(wrap, { signal: AbortSignal.timeout(5000) });
+      } catch (err) {
+        console.warn('Failed to publish gift wrap via pool', err);
+      }
+    }
+    return;
+  }
+
+  // Publish to each target relay
+  for (const wrap of wraps) {
+    for (const relayUrl of targetRelays) {
+      try {
+        const relay = nostr.relay(relayUrl);
+        await relay.event(wrap, { signal: AbortSignal.timeout(5000) });
+      } catch (err) {
+        console.warn(`Failed to publish to ${relayUrl}`, err);
+      }
+    }
+  }
+}
 
 /**
  * Fetch gift-wrapped events addressed to the current user.
@@ -266,7 +329,6 @@ function deduplicateReceipts(receipts: WhisperReceipt[]): WhisperReceipt[] {
 export function useSendMessage() {
   const { nostr } = useNostr();
   const { user } = useCurrentUser();
-  const { mutateAsync: getDmRelays } = useDmRelays(undefined);
 
   return useMutation({
     mutationFn: async ({
@@ -310,9 +372,9 @@ export function useSendMessage() {
         user.pubkey,
       );
 
-      // Determine recipients for gift wrapping
+      // Determine recipients for gift wrapping (all other members + self)
       const recipients = groupId && groupMembers
-        ? groupMembers.filter((p) => p !== user.pubkey) // send to all other members
+        ? groupMembers.filter((p) => p !== user.pubkey)
         : [recipientPubkey!];
 
       // Also gift-wrap to self (so we can see our own messages on other devices)
@@ -321,62 +383,12 @@ export function useSendMessage() {
       // Gift-wrap for each recipient
       const wraps = giftWrapToMany(rumor, recipients);
 
-      // Get the recipient's DM relays
-      const targetRelays = new Set<string>();
-
-      // For each recipient, fetch their DM relay list
-      for (const recipient of recipients) {
-        if (recipient === user.pubkey) {
-          // Use our own write relays for self
-          continue;
-        }
-        const { data: relays } = await useDmRelaysFetcher(nostr, recipient);
-        if (relays && relays.length > 0) {
-          relays.forEach((r) => targetRelays.add(r));
-        }
-      }
-
-      // If no DM relays found, use the app's default write relays
-      if (targetRelays.size === 0) {
-        // Fall back to publishing via the pool's event router
-        for (const wrap of wraps) {
-          await nostr.event(wrap, { signal: AbortSignal.timeout(5000) });
-        }
-      } else {
-        // Publish to target relays directly
-        for (const wrap of wraps) {
-          for (const relayUrl of targetRelays) {
-            try {
-              const relay = nostr.relay(relayUrl);
-              await relay.event(wrap, { signal: AbortSignal.timeout(5000) });
-            } catch (err) {
-              console.warn(`Failed to publish to ${relayUrl}`, err);
-            }
-          }
-        }
-      }
+      // Publish to recipients' DM relays (falls back to pool's write relays)
+      await publishGiftWraps(nostr, wraps, recipients);
 
       return rumor;
     },
   });
-}
-
-// Helper to fetch DM relays without a hook context
-async function useDmRelaysFetcher(nostr: ReturnType<typeof useNostr>['nostr'], pubkey: string): Promise<{ data: string[] }> {
-  try {
-    const [event] = await nostr.query(
-      [{ kinds: [10050], authors: [pubkey], limit: 1 }],
-      { signal: AbortSignal.timeout(3000) },
-    );
-    if (!event) return { data: [] };
-    const relays = event.tags
-      .filter(([n]) => n === 'relay')
-      .map(([, url]) => url)
-      .filter(Boolean);
-    return { data: relays };
-  } catch {
-    return { data: [] };
-  }
 }
 
 /**
@@ -410,20 +422,7 @@ export function useSendReadReceipt() {
 
       const wrap = giftWrap(rumor, senderPubkey);
 
-      // Publish to sender's DM relays
-      const { data: relays } = await useDmRelaysFetcher(nostr, senderPubkey);
-      if (relays.length > 0) {
-        for (const relayUrl of relays) {
-          try {
-            const relay = nostr.relay(relayUrl);
-            await relay.event(wrap, { signal: AbortSignal.timeout(5000) });
-          } catch (err) {
-            console.warn(`Failed to publish receipt to ${relayUrl}`, err);
-          }
-        }
-      } else {
-        await nostr.event(wrap, { signal: AbortSignal.timeout(5000) });
-      }
+      await publishGiftWraps(nostr, [wrap], [senderPubkey]);
 
       return rumor;
     },
@@ -461,19 +460,7 @@ export function useSendDeliveryReceipt() {
 
       const wrap = giftWrap(rumor, senderPubkey);
 
-      const { data: relays } = await useDmRelaysFetcher(nostr, senderPubkey);
-      if (relays.length > 0) {
-        for (const relayUrl of relays) {
-          try {
-            const relay = nostr.relay(relayUrl);
-            await relay.event(wrap, { signal: AbortSignal.timeout(5000) });
-          } catch (err) {
-            console.warn(`Failed to publish receipt to ${relayUrl}`, err);
-          }
-        }
-      } else {
-        await nostr.event(wrap, { signal: AbortSignal.timeout(5000) });
-      }
+      await publishGiftWraps(nostr, [wrap], [senderPubkey]);
 
       return rumor;
     },
@@ -483,6 +470,8 @@ export function useSendDeliveryReceipt() {
 /**
  * Send a typing indicator.
  * WIP-03: kind 14 rumor with typing tag, ephemeral gift wrap (kind 21059).
+ *
+ * This is fire-and-forget — errors are caught and logged, never thrown.
  */
 export function useSendTypingIndicator() {
   const { nostr } = useNostr();
@@ -525,26 +514,10 @@ export function useSendTypingIndicator() {
       // Use ephemeral gift wraps (kind 21059)
       const wraps = giftWrapToMany(rumor, recipients, true);
 
-      // Publish via the pool (ephemeral, not stored)
-      for (const wrap of wraps) {
-        try {
-          const { data: relays } = await useDmRelaysFetcher(nostr, recipients.find((r) => r !== user.pubkey) ?? recipients[0]);
-          if (relays.length > 0) {
-            for (const relayUrl of relays) {
-              try {
-                const relay = nostr.relay(relayUrl);
-                await relay.event(wrap, { signal: AbortSignal.timeout(3000) });
-              } catch (err) {
-                console.warn(`Failed to publish typing to ${relayUrl}`, err);
-              }
-            }
-          } else {
-            await nostr.event(wrap, { signal: AbortSignal.timeout(3000) });
-          }
-        } catch (err) {
-          console.warn('Failed to publish typing indicator', err);
-        }
-      }
+      // Publish fire-and-forget — typing indicators are best-effort
+      publishGiftWraps(nostr, wraps, recipients).catch((err) => {
+        console.warn('Failed to publish typing indicator', err);
+      });
 
       return rumor;
     },

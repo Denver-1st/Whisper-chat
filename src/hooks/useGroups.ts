@@ -6,9 +6,9 @@
  * sealed and gift-wrapped to all members via NIP-59.
  */
 import { useMutation } from '@tanstack/react-query';
+import { useNostr } from '@nostrify/react';
 
 import { useCurrentUser } from './useCurrentUser';
-import { useSendMessage } from './useWhisperMessages';
 
 import {
   createRumor,
@@ -25,11 +25,11 @@ import {
   type WhisperGroup,
   type GroupAction,
   generateGroupId,
-  type NostrEvent,
 } from '@/lib/whisper/constants';
 
-import { useNostr } from '@nostrify/react';
-import { useDmRelays } from './useDmRelays';
+import { publishGiftWraps } from './useWhisperMessages';
+
+type NostrPool = ReturnType<typeof useNostr>['nostr'];
 
 /** Create a new group chat. */
 export function useCreateGroup() {
@@ -82,7 +82,7 @@ export function useCreateGroup() {
       const wraps = giftWrapToMany(rumor, allMembers);
 
       // Publish to each member's DM relays
-      await publishToMemberRelays(nostr, allMembers, wraps);
+      await publishGiftWraps(nostr as NostrPool, wraps, allMembers);
 
       const group: WhisperGroup = {
         id: groupId,
@@ -148,7 +148,7 @@ export function useUpdateGroup() {
       );
 
       const wraps = giftWrapToMany(rumor, group.members);
-      await publishToMemberRelays(nostr, group.members, wraps);
+      await publishGiftWraps(nostr as NostrPool, wraps, group.members);
 
       return rumor;
     },
@@ -191,7 +191,7 @@ export function useAddGroupMember() {
 
       // Gift-wrap to all members including the new one
       const wraps = giftWrapToMany(rumor, updatedMembers);
-      await publishToMemberRelays(nostr, updatedMembers, wraps);
+      await publishGiftWraps(nostr as NostrPool, wraps, updatedMembers);
 
       return rumor;
     },
@@ -233,55 +233,9 @@ export function useRemoveGroupMember() {
       );
 
       const wraps = giftWrapToMany(rumor, updatedMembers);
-      await publishToMemberRelays(nostr, updatedMembers, wraps);
+      await publishGiftWraps(nostr as NostrPool, wraps, updatedMembers);
 
       return rumor;
     },
   });
-}
-
-/**
- * Publish gift-wrapped events to each recipient's DM relays.
- * Falls back to the app's default write relays if no DM relays are found.
- */
-async function publishToMemberRelays(
-  nostr: ReturnType<typeof useNostr>['nostr'],
-  members: string[],
-  wraps: NostrEvent[],
-) {
-  const targetRelays = new Set<string>();
-
-  for (const member of members) {
-    try {
-      const [event] = await nostr.query(
-        [{ kinds: [10050], authors: [member], limit: 1 }],
-        { signal: AbortSignal.timeout(3000) },
-      );
-      if (event) {
-        event.tags
-          .filter(([n]) => n === 'relay')
-          .forEach(([, url]) => targetRelays.add(url));
-      }
-    } catch {
-      // Ignore errors fetching relay lists
-    }
-  }
-
-  if (targetRelays.size === 0) {
-    // Fall back to pool's event router
-    for (const wrap of wraps) {
-      await nostr.event(wrap, { signal: AbortSignal.timeout(5000) });
-    }
-  } else {
-    for (const wrap of wraps) {
-      for (const relayUrl of targetRelays) {
-        try {
-          const relay = nostr.relay(relayUrl);
-          await relay.event(wrap, { signal: AbortSignal.timeout(5000) });
-        } catch (err) {
-          console.warn(`Failed to publish to ${relayUrl}`, err);
-        }
-      }
-    }
-  }
 }

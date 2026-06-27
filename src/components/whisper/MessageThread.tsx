@@ -97,27 +97,44 @@ export function MessageThread({ conversation, onBack }: MessageThreadProps) {
 
     setInputValue('');
 
-    // Send typing: false to stop indicator
+    // Fire typing: false indicator (non-blocking — don't wait for it)
     if (isGroup) {
-      await sendTyping({
+      sendTyping({
         groupId: conversation.groupId,
         groupMembers: conversation.group?.members,
         isTyping: false,
       }).catch(() => {});
-      await sendMessage({
-        content,
-        groupId: conversation.groupId,
-        groupMembers: conversation.group?.members,
-      });
     } else {
-      await sendTyping({
+      sendTyping({
         recipientPubkey: conversation.peerPubkey,
         isTyping: false,
       }).catch(() => {});
-      await sendMessage({
-        content,
-        recipientPubkey: conversation.peerPubkey,
-      });
+    }
+
+    // Clear the typing timeout so it doesn't fire after we send
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
+    }
+
+    // Send the actual message
+    try {
+      if (isGroup) {
+        await sendMessage({
+          content,
+          groupId: conversation.groupId,
+          groupMembers: conversation.group?.members,
+        });
+      } else {
+        await sendMessage({
+          content,
+          recipientPubkey: conversation.peerPubkey,
+        });
+      }
+    } catch (err) {
+      console.error('Failed to send message', err);
+      // Restore the text so the user doesn't lose their message
+      setInputValue(content);
     }
   }, [inputValue, user, isGroup, conversation, sendMessage, sendTyping]);
 
