@@ -1,7 +1,5 @@
 # Whisper Chat
 
-[![Edit with Shakespeare](https://shakespeare.diy/badge.svg)](https://shakespeare.diy/clone?url=https%3A%2F%2Fgithub.com%2FDenver-1st%2FWhisper-chat.git)
-
 **End-to-end encrypted, Nostr-native instant messaging.**
 
 Whisper Chat is a WhatsApp-style messaging client built on the [Whisper Relay protocol](https://github.com/Denver-1st/mprotocol) — a Nostr-native protocol family for building instant messaging clients on Nostr. Your Nostr identity is your messaging identity. All message content is end-to-end encrypted via NIP-44 and gift-wrapped via NIP-59. No phone numbers, no central servers, no tracking.
@@ -499,4 +497,3 @@ Public domain. See the [Whisper Relay protocol repository](https://github.com/De
 
 ---
 
-*Vibed with [Shakespeare](https://shakespeare.diy) — the AI-powered website builder.*
